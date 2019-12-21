@@ -10,6 +10,9 @@
     <ClCompile Include="src\REEngineImport.cpp">
       <Filter>Source</Filter>
     </ClCompile>
+    <ClCompile Include="src\MTFImport.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\RevilMax.h">

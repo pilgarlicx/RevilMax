@@ -124,7 +124,7 @@ const TCHAR *REEngineImport::OtherMessage2()
 
 unsigned int REEngineImport::Version()
 {				
-	return REVILMAXVERSIONINT;
+	return REVILMAX_VERSIONINT;
 }
 
 void REEngineImport::ShowAbout(HWND hWnd)

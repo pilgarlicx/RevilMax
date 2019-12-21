@@ -60,6 +60,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\DllEntry.cpp" />
+    <ClCompile Include="src\MTFImport.cpp" />
     <ClCompile Include="src\REEngineImport.cpp" />
     <ClCompile Include="src\RevilMax.cpp" />
   </ItemGroup>
@@ -120,7 +121,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <Optimization>MaxSpeed</Optimization>
+      <Optimization>Disabled</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
