@@ -116,7 +116,10 @@ struct LMTNode {
     Matrix3 mtx;
   };
   INode *nde;
+  INode *ikTarget = nullptr;
   int LMTBone;
+
+  INode *GetNode() { return ikTarget ? ikTarget : nde; }
 
   LMTNode(INode *input) : nde(input) {
     ReflectorWrap<LMTNode> refl(this);
@@ -139,20 +142,24 @@ struct LMTNode {
                              esStringConvert<char>(value.data()).c_str());
     }
 
+    BOOL isNub = 0;
+
+    if (nde->GetUserPropBool(_T("isnub"), isNub)) {
+      TSTRING bneName = nde->GetName();
+
+      if (isNub) {
+        ikTarget = GetCOREInterface()->GetINodeByName(
+            (bneName + _T("_IKTarget")).c_str());
+      } else {
+        ikTarget = GetCOREInterface()->GetINodeByName(
+            (bneName + _T("_IKNub")).c_str());
+      }
+    }
+
     if (!corrupted)
       return;
 
     mtx = nde->GetNodeTM(0);
-
-    if (nde->GetParentNode()->IsRootNode()) {
-      Matrix3 invCormat = corMat;
-      invCormat.Invert();
-      mtx *= invCormat;
-    } else {
-      Matrix3 invParent = nde->GetParentTM(0);
-      invParent.Invert();
-      mtx *= invParent;
-    }
 
     for (int r = 0; r < numRefl; r++) {
       Reflector::KVPair reflPair = refl.GetReflectedPair(r);
@@ -167,9 +174,9 @@ struct LMTNode {
 REFLECTOR_CREATE(LMTNode, 1, VARNAMES, LMTBone, r1, r2, r3, r4);
 
 static class : public ITreeEnumProc {
+public:
   const MSTR boneNameHint = _T("LMTBone");
 
-public:
   std::vector<LMTNode> bones;
 
   void RescanBones() {
@@ -189,10 +196,50 @@ public:
     }
   }
 
-  INode *LookupNode(int ID) {
+  void RestoreBasePose() {
+    for (auto &n : bones) {
+      SuspendAnimate();
+      AnimateOn();
+      n.nde->SetNodeTM(-GetTicksPerFrame(), n.mtx);
+      AnimateOff();
+    }
+  }
+
+  void ResetScene() {
+    for (auto &n : bones) {
+      Control *cnt = n.nde->GetTMController();
+      //cnt->GetScaleController()->DeleteKeys(TRACK_DOALL);
+      //cnt->GetRotationController()->DeleteKeys(TRACK_DOALL);
+      //cnt->GetPositionController()->DeleteKeys(TRACK_DOALL);
+
+     if (cnt->GetRotationController()->ClassID() !=
+          Class_ID(LININTERP_ROTATION_CLASS_ID, 0))
+        cnt->SetRotationController((Control *)CreateInstance(
+            CTRL_ROTATION_CLASS_ID, Class_ID(LININTERP_ROTATION_CLASS_ID, 0)));
+
+      if (cnt->GetScaleController()->ClassID() !=
+          Class_ID(LININTERP_SCALE_CLASS_ID, 0))
+        cnt->SetScaleController((Control *)CreateInstance(
+            CTRL_SCALE_CLASS_ID, Class_ID(LININTERP_SCALE_CLASS_ID, 0)));
+
+      if (cnt->GetPositionController()->ClassID() !=
+          Class_ID(LININTERP_POSITION_CLASS_ID, 0))
+        cnt->SetPositionController((Control *)CreateInstance(
+            CTRL_POSITION_CLASS_ID, Class_ID(LININTERP_POSITION_CLASS_ID, 0)));
+
+      SuspendAnimate();
+      AnimateOn();
+
+      n.nde->SetNodeTM(0, n.mtx);
+
+      AnimateOff();
+    }
+  }
+
+  LMTNode *LookupNode(int ID) {
     for (auto &b : bones) {
       if (b.LMTBone == ID)
-        return b.nde;
+        return &b;
     }
 
     return nullptr;
@@ -206,6 +253,239 @@ public:
     return TREE_CONTINUE;
   }
 } iBoneScanner;
+
+struct MTFTrackPair {
+  INode *nde;
+  const LMTTrack *track;
+  INode *scaleNode;
+  MTFTrackPair *parent;
+  std::vector<Vector4A16> frames;
+  std::vector<MTFTrackPair *> children;
+
+  MTFTrackPair(INode *inde, const LMTTrack *tck, MTFTrackPair *prent = nullptr)
+      : nde(inde), track(tck), scaleNode(nullptr), parent(prent) {}
+};
+
+typedef std::vector<MTFTrackPair> MTFTrackPairCnt;
+typedef std::vector<TimeValue> Times;
+typedef std::vector<float> Secs;
+
+static bool IsRoot(MTFTrackPairCnt &collection, INode *item) {
+  if (item->IsRootNode())
+    return true;
+
+  auto fnd = std::find_if(collection.begin(), collection.end(),
+                          [item](const MTFTrackPair &i0) {
+                            return i0.nde == item->GetParentNode();
+                          });
+
+  if (fnd != collection.end())
+    return false;
+
+  return IsRoot(collection, item->GetParentNode());
+}
+
+static void BuildScaleHandles(MTFTrackPairCnt &pairs, MTFTrackPair &item,
+                              const Times &times) {
+  INode *fNode = item.nde;
+  int numChildren = fNode->NumberOfChildren();
+
+  for (int c = 0; c < numChildren; c++) {
+    int LMTIndex;
+    INode *childNode = fNode->GetChildNode(c);
+
+    if (childNode->GetUserPropInt(iBoneScanner.boneNameHint, LMTIndex) &&
+        LMTIndex == -2) {
+      item.scaleNode = childNode;
+      break;
+    }
+  }
+
+  if (!item.scaleNode) {
+    item.scaleNode = item.nde;
+
+    Object *obj = static_cast<Object *>(
+        CreateInstance(HELPER_CLASS_ID, Class_ID(DUMMY_CLASS_ID, 0)));
+    item.nde = GetCOREInterface()->CreateObjectNode(obj);
+    item.nde->ShowBone(2);
+    item.nde->SetWireColor(0x80ff);
+    Matrix3 gt = item.scaleNode->GetNodeTM(0);
+    item.nde->SetNodeTM(0, gt);
+
+    TSTRING bName = item.scaleNode->GetName();
+    bName.append(_T("_sp"));
+
+    item.nde->SetName(ToBoneName(bName));
+
+    LMTNode lNode(item.scaleNode);
+
+    item.nde->SetUserPropInt(iBoneScanner.boneNameHint, lNode.LMTBone);
+
+    item.scaleNode->SetUserPropInt(iBoneScanner.boneNameHint, -2);
+    item.scaleNode->GetParentNode()->AttachChild(item.nde);
+  }
+
+  for (int c = 0; c < numChildren; c++)
+    item.nde->AttachChild(item.scaleNode->GetChildNode(c));
+
+  item.nde->AttachChild(item.scaleNode);
+
+  item.frames.resize(times.size(), Vector4A16(1.f));
+
+  item.scaleNode->GetTMController()->GetRotationController()->DeleteKeys(
+      TRACK_DOALL);
+  item.scaleNode->GetTMController()->GetPositionController()->DeleteKeys(
+      TRACK_DOALL);
+
+  Matrix3 pTM = item.nde->GetNodeTM(0);
+
+  AnimateOn();
+  item.scaleNode->SetNodeTM(0, pTM);
+  AnimateOff();
+
+  fNode = item.nde;
+  numChildren = fNode->NumberOfChildren();
+
+  for (int c = 0; c < numChildren; c++) {
+    int LMTIndex;
+    INode *childNode = fNode->GetChildNode(c);
+
+    if (childNode->GetUserPropInt(iBoneScanner.boneNameHint, LMTIndex) &&
+        LMTIndex == -2) {
+      continue;
+    } else {
+      const LMTTrack *foundTrack = nullptr;
+
+      for (auto &t : pairs)
+        if (t.nde == childNode || t.scaleNode == childNode) {
+          foundTrack = t.track;
+          break;
+        }
+
+      MTFTrackPair *nChild = new MTFTrackPair(childNode, foundTrack, &item);
+      item.children.push_back(nChild);
+      BuildScaleHandles(pairs, **std::prev(item.children.end()), times);
+    }
+  }
+}
+
+static void PopulateScaleData(MTFTrackPair &item, const Times &times,
+                              const Secs &secs) {
+  if (!item.scaleNode)
+    return;
+
+  const size_t numKeys = times.size();
+  Control *cnt = item.scaleNode->GetTMController()->GetScaleController();
+
+  AnimateOn();
+
+  if (item.track) {
+    for (int t = 0; t < numKeys; t++) {
+      Vector4A16 cVal;
+      item.track->Interpolate(cVal, secs[t]);
+      item.frames[t] *= cVal;
+
+      if (item.parent)
+        item.frames[t] *= item.parent->frames[t];
+
+      Point3 kVal(item.frames[t].X, item.frames[t].Y, item.frames[t].Z);
+
+      cnt->SetValue(times[t], &kVal);
+    }
+  }
+
+  AnimateOff();
+
+  for (auto &c : item.children) {
+    PopulateScaleData(*c, times, secs);
+  }
+}
+
+static void
+FixupHierarchialTranslations(INode *nde, const Times &times,
+                             const std::vector<Vector4A16> &scaleValues,
+                             const std::vector<Matrix3> *parentTransforms) {
+  const size_t numKeys = times.size();
+  const int numChildren = nde->NumberOfChildren();
+  std::vector<Point3> values;
+  values.resize(numKeys);
+
+  for (int c = 0; c < numChildren; c++) {
+    INode *childNode = nde->GetChildNode(c);
+    int LMTIndex;
+
+    if (childNode->GetUserPropInt(iBoneScanner.boneNameHint, LMTIndex) &&
+        LMTIndex == -2)
+      continue;
+
+    for (int t = 0; t < numKeys; t++) {
+      Matrix3 rVal = childNode->GetNodeTM(times[t]);
+      Matrix3 pVal = nde->GetNodeTM(times[t]);
+      pVal.Invert();
+      rVal *= pVal;
+      values[t] = rVal.GetTrans() *
+                  Point3(scaleValues[t].X, scaleValues[t].Y, scaleValues[t].Z);
+    }
+
+    /*for (int t = 0; t < numKeys; t++) {
+      Matrix3 rVal = childNode->GetNodeTM(times[t]);
+      Matrix3 pVal = parentTransforms->at(t);
+      pVal.Invert();
+      rVal *= pVal;
+      rVal.SetTrans(rVal.GetTrans() * Point3(scaleValues[t].X, scaleValues[t].Y,
+    scaleValues[t].Z)); pVal.Invert(); rVal *= pVal; pVal =
+    nde->GetNodeTM(times[t]); pVal.Invert(); rVal *= pVal; values[t] =
+    rVal.GetTrans();
+    }*/
+
+    Control *cnt = childNode->GetTMController()->GetPositionController();
+
+    AnimateOn();
+
+    for (int t = 0; t < numKeys; t++) {
+      cnt->SetValue(times[t], &values[t]);
+    }
+
+    AnimateOff();
+    //FixupHierarchialTranslations(childNode, times, scaleValues,
+                                // parentTransforms);
+  }
+}
+
+static void ScaleTranslations(MTFTrackPair &item, const Times &times) {
+  if (!item.scaleNode)
+    return;
+
+  std::vector<Matrix3> absValues;
+  absValues.reserve(times.size());
+
+  for (auto t : times)
+    absValues.push_back(item.nde->GetNodeTM(t));
+
+  FixupHierarchialTranslations(item.nde, times, item.frames, &absValues);
+
+  for (auto &c : item.children) {
+    ScaleTranslations(*c, times);
+  }
+}
+
+static void ApplyScaleTracks(MTFTrackPairCnt &tracks, const Times &times,
+                             const Secs &secs) {
+  std::vector<MTFTrackPair *> rootsOnly;
+
+  for (auto &s : tracks)
+    if (IsRoot(tracks, s.nde))
+      rootsOnly.push_back(&s);
+
+  for (auto &s : rootsOnly)
+    BuildScaleHandles(tracks, *s, times);
+
+  for (auto &s : rootsOnly)
+    PopulateScaleData(*s, times, secs);
+
+  for (auto &s : rootsOnly)
+    ScaleTranslations(*s, times);
+}
 
 void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
   const int numTracks = mot.NumTracks();
@@ -221,190 +501,115 @@ void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
   else
     numTicks -= overlappingTicks;
 
-  Interval aniRange(0, numTicks);
-  GetCOREInterface()->SetAnimRange(aniRange);
+  Interval aniRange(0, numTicks - ticksPerFrame);
+  GetCOREInterface()->SetAnimRange({-TIME_TICKSPERSEC, numTicks});
+  std::vector<float> frameTimes;
+  Times frameTimesTicks;
 
-  /*std::vector<float> frameTimes;
+  for (TimeValue v = 0; v <= aniRange.End(); v += GetTicksPerFrame()) {
+    frameTimes.push_back(TicksToSec(v));
+    frameTimesTicks.push_back(v);
+  }
 
-  for (TimeValue v = 0; v <= aniRange.End(); v += GetTicksPerFrame())
-    frameTimes.push_back(TicksToSec(v));*/
+  std::vector<MTFTrackPair> scaleTracks;
 
   for (int t = 0; t < numTracks; t++) {
     const LMTTrack *tck = mot.Track(t);
     const int boneID = tck->AnimatedBoneID();
-    const int numFrames = tck->NumFrames();
+    LMTNode *lNode = iBoneScanner.LookupNode(boneID);
 
-    INode *fNode = iBoneScanner.LookupNode(boneID);
+    if (lNode && tck->GetTrackType() == LMTTrack::TrackType_LocalScale)
+      scaleTracks.emplace_back(lNode->nde, tck);
+  }
 
-    if (!fNode) {
+  std::vector<MTFTrackPair *> rootsOnly;
+
+  for (auto &s : scaleTracks)
+    if (IsRoot(scaleTracks, s.nde))
+      rootsOnly.push_back(&s);
+
+  for (auto &s : rootsOnly)
+    BuildScaleHandles(scaleTracks, *s, frameTimesTicks);
+
+  iBoneScanner.RescanBones();
+  iBoneScanner.ResetScene();
+
+  for (int t = 0; t < numTracks; t++) {
+    const LMTTrack *tck = mot.Track(t);
+    const int boneID = tck->AnimatedBoneID();
+    LMTNode *lNode = iBoneScanner.LookupNode(boneID);
+
+    if (!lNode) {
       printwarning("[MTF] Couldn't find LMTBone: ", << boneID);
       continue;
     }
 
+    INode *fNode = lNode->GetNode();
     Control *cnt = fNode->GetTMController();
     const LMTTrack::TrackType tckType = tck->GetTrackType();
 
     switch (tckType) {
     case LMTTrack::TrackType_AbsolutePosition:
     case LMTTrack::TrackType_LocalPosition: {
-      if (cnt->GetPositionController()->ClassID() !=
-          Class_ID(LININTERP_POSITION_CLASS_ID, 0))
-        cnt->SetPositionController((Control *)CreateInstance(
-            CTRL_POSITION_CLASS_ID, Class_ID(LININTERP_POSITION_CLASS_ID, 0)));
-
       Control *posCnt = cnt->GetPositionController();
-      IKeyControl *kCon = GetKeyControlInterface(posCnt);
 
-      kCon->SetNumKeys(numFrames);
+      AnimateOn();
 
-      for (int f = 0; f < numFrames; f++) {
-        TimeValue atTime = startTime + tck->GetFrame(f) * GetTicksPerFrame();
-
+      for (auto ft : frameTimes) {
         Vector4A16 cVal;
-        tck->Evaluate(cVal, f);
-
-        ILinPoint3Key cKey;
-        cKey.time = atTime;
-        cKey.val = reinterpret_cast<Point3 &>(cVal) * IDC_EDIT_SCALE_value;
+        tck->Interpolate(cVal, ft);
+        cVal *= IDC_EDIT_SCALE_value;
+        Point3 kVal = reinterpret_cast<Point3 &>(cVal);
 
         if (fNode->GetParentNode()->IsRootNode() ||
             tckType == LMTTrack::TrackType_AbsolutePosition)
-          cKey.val = corMat.PointTransform(cKey.val);
+          kVal = corMat.PointTransform(kVal);
 
-        kCon->SetKey(f, &cKey);
+        posCnt->SetValue(SecToTicks(ft), &kVal);
       }
 
+      AnimateOff();
       break;
     }
     case LMTTrack::TrackType_AbsoluteRotation:
     case LMTTrack::TrackType_LocalRotation: {
-      if (cnt->GetRotationController()->ClassID() !=
-          Class_ID(LININTERP_ROTATION_CLASS_ID, 0))
-        cnt->SetRotationController((Control *)CreateInstance(
-            CTRL_ROTATION_CLASS_ID, Class_ID(LININTERP_ROTATION_CLASS_ID, 0)));
-
       Control *rotCnt = (Control *)CreateInstance(
           CTRL_ROTATION_CLASS_ID, Class_ID(HYBRIDINTERP_ROTATION_CLASS_ID, 0));
-      IKeyControl *kCon = GetKeyControlInterface(rotCnt);
 
-      kCon->SetNumKeys(numFrames);
+      AnimateOn();
 
-      for (int f = 0; f < numFrames; f++) {
-        TimeValue atTime = startTime + tck->GetFrame(f) * GetTicksPerFrame();
-
+      for (auto ft : frameTimes) {
         Vector4A16 cVal;
-        tck->Evaluate(cVal, f);
-
-        ILinRotKey cKey;
-        cKey.time = atTime;
-        cKey.val = reinterpret_cast<Quat &>(cVal).Conjugate();
+        tck->Interpolate(cVal, ft);
+        Quat kVal = reinterpret_cast<Quat &>(cVal).Conjugate();
 
         if (fNode->GetParentNode()->IsRootNode() ||
             tckType == LMTTrack::TrackType_AbsoluteRotation) {
           Matrix3 cMat;
-          cMat.SetRotate(cKey.val);
-          cKey.val = cMat * corMat;
+          cMat.SetRotate(kVal);
+          kVal = cMat * corMat;
         }
 
-        kCon->SetKey(f, &cKey);
+        rotCnt->SetValue(SecToTicks(ft), &kVal);
       }
 
+      AnimateOff();
       cnt->GetRotationController()->Copy(rotCnt); // Gimbal fix
 
       break;
     }
-    case LMTTrack::TrackType_LocalScale: {
-      if (fNode->NumberOfChildren()) {
-        printwarning("Scale on bone with children:", << fNode->GetName());
-        break;
-      }
-
-      if (cnt->GetScaleController()->ClassID() !=
-          Class_ID(LININTERP_SCALE_CLASS_ID, 0))
-        cnt->SetScaleController((Control *)CreateInstance(
-            CTRL_SCALE_CLASS_ID, Class_ID(LININTERP_SCALE_CLASS_ID, 0)));
-
-      Control *sclCnt = cnt->GetScaleController();
-      IKeyControl *kCon = GetKeyControlInterface(sclCnt);
-
-      kCon->SetNumKeys(numFrames);
-
-      for (int f = 0; f < numFrames; f++) {
-        TimeValue atTime = startTime + tck->GetFrame(f) * GetTicksPerFrame();
-
-        Vector4A16 cVal;
-        tck->Evaluate(cVal, f);
-
-        ILinPoint3Key cKey;
-        cKey.time = atTime;
-        cKey.val = reinterpret_cast<Point3 &>(cVal);
-
-        if (fNode->GetParentNode()->IsRootNode())
-          cKey.val = corMat.PointTransform(cKey.val);
-
-        kCon->SetKey(f, &cKey);
-      }
-
-      break;
-    }
-
     default:
       break;
     }
   }
 
-  /*SuspendAnimate();
-  AnimateOn();
+  for (auto &s : rootsOnly)
+    PopulateScaleData(*s, frameTimesTicks, frameTimes);
 
-  for (auto b : iBoneScanner.bones) {
-    INode *ffNode = b.nde;
+  for (auto &s : rootsOnly)
+    ScaleTranslations(*s, frameTimesTicks);
 
-    if (!ffNode->GetParentNode()->IsRootNode()) {
-      Control *cnt = ffNode->GetTMController();
-
-      if (cnt->GetPositionController()->ClassID() !=
-          Class_ID(LININTERP_POSITION_CLASS_ID, 0))
-        cnt->SetPositionController((Control *)CreateInstance(
-            CTRL_POSITION_CLASS_ID, Class_ID(LININTERP_POSITION_CLASS_ID, 0)));
-
-      if (cnt->GetRotationController()->ClassID() !=
-          Class_ID(LININTERP_ROTATION_CLASS_ID, 0))
-        cnt->SetRotationController((Control *)CreateInstance(
-            CTRL_ROTATION_CLASS_ID, Class_ID(LININTERP_ROTATION_CLASS_ID, 0)));
-
-      if (cnt->GetScaleController()->ClassID() !=
-          Class_ID(LININTERP_SCALE_CLASS_ID, 0))
-        cnt->SetScaleController((Control *)CreateInstance(
-            CTRL_SCALE_CLASS_ID, Class_ID(LININTERP_SCALE_CLASS_ID, 0)));
-
-      for (TimeValue v = 0; v <= aniRange.End(); v += GetTicksPerFrame()) {
-        //Matrix3 pAbsMat = fNode->GetParentTM(v);
-        //Point3 nScale = {pAbsMat.GetRow(0).Length(),
-  pAbsMat.GetRow(1).Length(),
-        //                 pAbsMat.GetRow(2).Length()};
-
-        //pAbsMat.Invert();
-
-        //for (int s = 0; s < 3; s++)
-        //  if (!nScale[s])
-        //    nScale[s] = FLT_EPSILON;
-
-        Matrix3 cMat = ffNode->GetNodeTM(v);
-       // *pAbsMat;
-        //Point3 fracPos = cMat.GetTrans() / nScale;
-        //nScale = 1.f - nScale;
-        //cMat.Translate(fracPos * nScale);
-
-        SetXFormPacket packet(cMat);
-
-        cnt->SetValue(v, &packet);
-
-        // cnt->GetPositionController()->SetValue(v, &localPos);
-      }
-    }
-  }
-
-  AnimateOff();*/
+  GetCOREInterface()->SetAnimRange(aniRange);
 }
 
 int MTFImport::DoImport(const TCHAR *fileName, ImpInterface * /*importerInt*/,
@@ -440,6 +645,8 @@ int MTFImport::DoImport(const TCHAR *fileName, ImpInterface * /*importerInt*/,
 
   iBoneScanner.RescanBones();
   LoadMotion(*mot);
+  iBoneScanner.RescanBones();
+  iBoneScanner.RestoreBasePose();
 
   setlocale(LC_NUMERIC, oldLocale);
 
