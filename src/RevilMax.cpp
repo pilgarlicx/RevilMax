@@ -13,7 +13,7 @@
 
         You should have received a copy of the GNU General Public License
         along with this program.If not, see <https://www.gnu.org/licenses/>.
-        
+        
         Revil Tool uses RevilLib 2017-2019 Lukas Cone
 */
 
@@ -44,7 +44,9 @@ const TCHAR _homePage[] =
 
 RevilMax::RevilMax()
     : CFGFile(nullptr), hWnd(nullptr), comboHandle(nullptr),
-      IDConfigValue(IDC_EDIT_SCALE)(1.0f), IDConfigIndex(IDC_CB_MOTION)(0) {}
+      IDConfigValue(IDC_EDIT_SCALE)(1.0f), IDConfigIndex(IDC_CB_MOTION)(0),
+      IDConfigIndex(IDC_CB_FRAMERATE)(1),
+      flags(IDC_RD_ANISEL_checked, IDC_CB_MOTION_enabled) {}
 
 void RevilMax::BuildCFG() {
   cfgpath = IPathConfigMgr::GetPathConfigMgr()->GetDir(APP_PLUGCFG_DIR);
@@ -58,6 +60,11 @@ void RevilMax::LoadCFG() {
 
   GetCFGValue(IDC_EDIT_SCALE);
   GetCFGIndex(IDC_CB_MOTION);
+  GetCFGIndex(IDC_CB_FRAMERATE);
+  GetCFGChecked(IDC_RD_ANISEL);
+  GetCFGChecked(IDC_RD_ANIALL);
+  GetCFGChecked(IDC_CH_RESAMPLE);
+  GetCFGEnabled(IDC_CB_MOTION);
 }
 
 void RevilMax::SaveCFG() {
@@ -66,6 +73,11 @@ void RevilMax::SaveCFG() {
 
   SetCFGIndex(IDC_CB_MOTION);
   SetCFGValue(IDC_EDIT_SCALE);
+  SetCFGIndex(IDC_CB_FRAMERATE);
+  SetCFGChecked(IDC_RD_ANISEL);
+  SetCFGChecked(IDC_RD_ANIALL);
+  SetCFGChecked(IDC_CH_RESAMPLE);
+  SetCFGEnabled(IDC_CB_MOTION);
 }
 
 static INT_PTR CALLBACK DialogCallbacks(HWND hWnd, UINT message, WPARAM wParam,
@@ -83,6 +95,14 @@ static INT_PTR CALLBACK DialogCallbacks(HWND hWnd, UINT message, WPARAM wParam,
     SetupIntSpinner(hWnd, IDC_SPIN_SCALE, IDC_EDIT_SCALE, 0, 5000,
                     imp->IDC_EDIT_SCALE_value);
     SetWindowText(hWnd, _T("Revil Motion Import v" REVILMAX_VERSION_S));
+
+    if (imp->instanceDialogType == RevilMax::DLGTYPE_LMT) {
+      HWND fpsHandle = GetDlgItem(hWnd, IDC_CB_FRAMERATE);
+      EnableWindow(fpsHandle, true);
+      SendMessage(fpsHandle, CB_ADDSTRING, 0, (LPARAM) _T("30"));
+      SendMessage(fpsHandle, CB_ADDSTRING, 0, (LPARAM) _T("60"));
+      SendMessage(fpsHandle, CB_SETCURSEL, imp->IDC_CB_FRAMERATE_index, 0);
+    }
 
     HWND butt = GetDlgItem(hWnd, IDC_BT_DONE);
     RECT buttRect;
@@ -111,7 +131,8 @@ static INT_PTR CALLBACK DialogCallbacks(HWND hWnd, UINT message, WPARAM wParam,
 
       SendMessage(imp->comboHandle, CB_SETCURSEL, imp->IDC_CB_MOTION_index, 0);
 
-      EnableWindow(imp->comboHandle, true);
+      EnableWindow(imp->comboHandle,
+                   imp->flags[RevilMax::IDC_RD_ANISEL_checked]);
     }
 
     return TRUE;
@@ -177,6 +198,40 @@ static INT_PTR CALLBACK DialogCallbacks(HWND hWnd, UINT message, WPARAM wParam,
       EndDialog(hWnd, 0);
       imp->SaveCFG();
       return 1;
+
+      MSGCheckbox(IDC_CH_RESAMPLE);
+      break;
+
+      MSGCheckbox(IDC_RD_ANIALL);
+      imp->flags(RevilMax::IDC_RD_ANISEL_checked, false);
+      MSGEnable(IDC_RD_ANISEL, IDC_CB_MOTION);
+      break;
+
+      MSGCheckbox(IDC_RD_ANISEL);
+      imp->flags(RevilMax::IDC_RD_ANIALL_checked, false);
+      MSGEnable(IDC_RD_ANISEL, IDC_CB_MOTION);
+      break;
+
+    case IDC_CB_MOTION: {
+      switch (HIWORD(wParam)) {
+      case CBN_SELCHANGE: {
+        const LRESULT curSel = SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+        imp->IDC_CB_MOTION_index = curSel;
+        return TRUE;
+      } break;
+      }
+      break;
+    }
+    case IDC_CB_FRAMERATE: {
+      switch (HIWORD(wParam)) {
+      case CBN_SELCHANGE: {
+        const LRESULT curSel = SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+        imp->IDC_CB_FRAMERATE_index = curSel;
+        return TRUE;
+      } break;
+      }
+      break;
+    }
     }
 
   case CC_SPINNER_CHANGE:
@@ -186,17 +241,6 @@ static INT_PTR CALLBACK DialogCallbacks(HWND hWnd, UINT message, WPARAM wParam,
           reinterpret_cast<ISpinnerControl *>(lParam)->GetFVal();
       break;
     }
-
-  case IDC_CB_MOTION: {
-    switch (HIWORD(wParam)) {
-    case CBN_SELCHANGE: {
-      const LRESULT curSel = SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
-      imp->IDC_CB_MOTION_index = curSel;
-      return TRUE;
-    } break;
-    }
-    break;
-  }
   }
   return 0;
 }

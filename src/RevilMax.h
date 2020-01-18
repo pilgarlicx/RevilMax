@@ -48,6 +48,9 @@ static const Matrix3 corMat = {{1.0f, 0.0f, 0.0f},
                                {0.0f, 0.0f, 0.0f}};
 class RevilMax {
 public:
+  enum DLGTYPE_e { DLGTYPE_unknown, DLGTYPE_MOT, DLGTYPE_LMT };
+
+  DLGTYPE_e instanceDialogType;
   HWND comboHandle;
   HWND hWnd;
   TSTRING cfgpath;
@@ -55,8 +58,18 @@ public:
   std::vector<TSTRING> motionNames;
   int windowSize, button1Distance, button2Distance;
 
+  enum ConfigBoolean {
+    IDConfigBool(IDC_RD_ANIALL),
+    IDConfigBool(IDC_RD_ANISEL),
+    IDConfigBool(IDC_CH_RESAMPLE),
+    IDConfigVisible(IDC_CB_MOTION),
+  };
+
+  esFlags<uchar, ConfigBoolean> flags;
+
   NewIDConfigValue(IDC_EDIT_SCALE);
   NewIDConfigIndex(IDC_CB_MOTION);
+  NewIDConfigIndex(IDC_CB_FRAMERATE);
 
   void LoadCFG();
   void BuildCFG();

@@ -23,6 +23,7 @@
 #include "datas/VectorsSimd.hpp"
 #include "datas/esstring.h"
 #include "datas/masterprinter.hpp"
+#include <iiksys.h>
 #include <map>
 
 #define MTFImport_CLASS_ID Class_ID(0x46f85524, 0xd4337f2)
@@ -49,7 +50,7 @@ public:
   virtual int DoImport(const TCHAR *name, ImpInterface *i, Interface *gi,
                        BOOL suppressPrompts = FALSE); // Import file
 
-  void LoadMotion(const LMTAnimation &mot, TimeValue startTime = 0);
+  TimeValue LoadMotion(const LMTAnimation &mot, TimeValue startTime = 0);
 };
 
 class : public ClassDesc2 {
@@ -138,6 +139,11 @@ struct LMTNode {
       MSTR value;
       nde->GetUserPropString(usName.c_str(), value);
 
+      if (!value.length()) {
+        corrupted = true;
+        continue;
+      }
+
       refl.SetReflectedValue(reflPair.name,
                              esStringConvert<char>(value.data()).c_str());
     }
@@ -159,7 +165,10 @@ struct LMTNode {
     if (!corrupted)
       return;
 
-    mtx = nde->GetNodeTM(0);
+    Matrix3 pMat = nde->GetParentTM(0);
+    pMat.Invert();
+
+    mtx = nde->GetNodeTM(0) * pMat;
 
     for (int r = 0; r < numRefl; r++) {
       Reflector::KVPair reflPair = refl.GetReflectedPair(r);
@@ -196,43 +205,37 @@ public:
     }
   }
 
-  void RestoreBasePose() {
+  void RestoreBasePose(TimeValue atTime) {
+    AnimateOn();
+
     for (auto &n : bones) {
-      SuspendAnimate();
+      SetXFormPacket packet(n.mtx);
+      n.nde->GetTMController()->SetValue(atTime, &packet);
+    }
+
+    AnimateOff();
+  }
+
+  void LockPose(TimeValue atTime) {
+    for (auto &b : bones) {
+      Matrix3 pMat = b.nde->GetParentTM(atTime);
+      pMat.Invert();
+      Matrix3 mtx = b.nde->GetNodeTM(atTime) * pMat;
+      SetXFormPacket packet(mtx);
       AnimateOn();
-      n.nde->SetNodeTM(-GetTicksPerFrame(), n.mtx);
+      b.nde->GetTMController()->SetValue(atTime, &packet);
       AnimateOff();
     }
   }
 
   void ResetScene() {
+    SuspendAnimate();
+
     for (auto &n : bones) {
       Control *cnt = n.nde->GetTMController();
-      //cnt->GetScaleController()->DeleteKeys(TRACK_DOALL);
-      //cnt->GetRotationController()->DeleteKeys(TRACK_DOALL);
-      //cnt->GetPositionController()->DeleteKeys(TRACK_DOALL);
-
-     if (cnt->GetRotationController()->ClassID() !=
-          Class_ID(LININTERP_ROTATION_CLASS_ID, 0))
-        cnt->SetRotationController((Control *)CreateInstance(
-            CTRL_ROTATION_CLASS_ID, Class_ID(LININTERP_ROTATION_CLASS_ID, 0)));
-
-      if (cnt->GetScaleController()->ClassID() !=
-          Class_ID(LININTERP_SCALE_CLASS_ID, 0))
-        cnt->SetScaleController((Control *)CreateInstance(
-            CTRL_SCALE_CLASS_ID, Class_ID(LININTERP_SCALE_CLASS_ID, 0)));
-
-      if (cnt->GetPositionController()->ClassID() !=
-          Class_ID(LININTERP_POSITION_CLASS_ID, 0))
-        cnt->SetPositionController((Control *)CreateInstance(
-            CTRL_POSITION_CLASS_ID, Class_ID(LININTERP_POSITION_CLASS_ID, 0)));
-
-      SuspendAnimate();
-      AnimateOn();
-
-      n.nde->SetNodeTM(0, n.mtx);
-
-      AnimateOff();
+      cnt->GetScaleController()->DeleteKeys(TRACK_DOALL | TRACK_RIGHTTOLEFT);
+      cnt->GetRotationController()->DeleteKeys(TRACK_DOALL | TRACK_RIGHTTOLEFT);
+      cnt->GetPositionController()->DeleteKeys(TRACK_DOALL | TRACK_RIGHTTOLEFT);
     }
   }
 
@@ -285,8 +288,8 @@ static bool IsRoot(MTFTrackPairCnt &collection, INode *item) {
   return IsRoot(collection, item->GetParentNode());
 }
 
-static void BuildScaleHandles(MTFTrackPairCnt &pairs, MTFTrackPair &item,
-                              const Times &times) {
+static INode *BuildScaleHandles(MTFTrackPairCnt &pairs, MTFTrackPair &item,
+                                const Times &times) {
   INode *fNode = item.nde;
   int numChildren = fNode->NumberOfChildren();
 
@@ -302,103 +305,99 @@ static void BuildScaleHandles(MTFTrackPairCnt &pairs, MTFTrackPair &item,
   }
 
   if (!item.scaleNode) {
-    item.scaleNode = item.nde;
+    INodeTab baseBone;
+    INodeTab clonedBone;
+    Point3 dummy;
+    baseBone.AppendNode(fNode);
 
-    Object *obj = static_cast<Object *>(
-        CreateInstance(HELPER_CLASS_ID, Class_ID(DUMMY_CLASS_ID, 0)));
-    item.nde = GetCOREInterface()->CreateObjectNode(obj);
-    item.nde->ShowBone(2);
-    item.nde->SetWireColor(0x80ff);
-    Matrix3 gt = item.scaleNode->GetNodeTM(0);
-    item.nde->SetNodeTM(0, gt);
+    GetCOREInterface()->CloneNodes(baseBone, dummy, false, NODE_COPY, nullptr,
+                                   &clonedBone);
+    item.scaleNode = fNode;
+    item.nde = clonedBone[0];
 
-    TSTRING bName = item.scaleNode->GetName();
+    TSTRING bName = fNode->GetName();
     bName.append(_T("_sp"));
 
     item.nde->SetName(ToBoneName(bName));
+    fNode->SetUserPropInt(iBoneScanner.boneNameHint, -2);
+    fNode->GetParentNode()->AttachChild(item.nde);
 
-    LMTNode lNode(item.scaleNode);
+    for (int c = 0; c < numChildren; c++)
+      item.nde->AttachChild(fNode->GetChildNode(0));
 
-    item.nde->SetUserPropInt(iBoneScanner.boneNameHint, lNode.LMTBone);
-
-    item.scaleNode->SetUserPropInt(iBoneScanner.boneNameHint, -2);
-    item.scaleNode->GetParentNode()->AttachChild(item.nde);
+    item.nde->AttachChild(fNode);
+    fNode->SetUserPropString(_T("r1"), _T(""));
+    fNode->SetUserPropString(_T("r2"), _T(""));
+    fNode->SetUserPropString(_T("r3"), _T(""));
+    fNode->SetUserPropString(_T("r4"), _T(""));
   }
 
-  for (int c = 0; c < numChildren; c++)
-    item.nde->AttachChild(item.scaleNode->GetChildNode(c));
-
-  item.nde->AttachChild(item.scaleNode);
-
   item.frames.resize(times.size(), Vector4A16(1.f));
-
-  item.scaleNode->GetTMController()->GetRotationController()->DeleteKeys(
-      TRACK_DOALL);
-  item.scaleNode->GetTMController()->GetPositionController()->DeleteKeys(
-      TRACK_DOALL);
-
-  Matrix3 pTM = item.nde->GetNodeTM(0);
-
-  AnimateOn();
-  item.scaleNode->SetNodeTM(0, pTM);
-  AnimateOff();
 
   fNode = item.nde;
   numChildren = fNode->NumberOfChildren();
 
+  std::vector<INode *> childNodes;
+
   for (int c = 0; c < numChildren; c++) {
-    int LMTIndex;
     INode *childNode = fNode->GetChildNode(c);
 
-    if (childNode->GetUserPropInt(iBoneScanner.boneNameHint, LMTIndex) &&
-        LMTIndex == -2) {
+    if (childNode == item.scaleNode)
       continue;
-    } else {
-      const LMTTrack *foundTrack = nullptr;
 
-      for (auto &t : pairs)
-        if (t.nde == childNode || t.scaleNode == childNode) {
-          foundTrack = t.track;
-          break;
-        }
-
-      MTFTrackPair *nChild = new MTFTrackPair(childNode, foundTrack, &item);
-      item.children.push_back(nChild);
-      BuildScaleHandles(pairs, **std::prev(item.children.end()), times);
-    }
+    childNodes.push_back(childNode);
   }
+
+  for (auto c : childNodes) {
+    const LMTTrack *foundTrack = nullptr;
+
+    for (auto &t : pairs)
+      if (t.nde == c || t.scaleNode == c) {
+        foundTrack = t.track;
+        break;
+      }
+
+    MTFTrackPair *nChild = new MTFTrackPair(c, foundTrack, &item);
+    item.children.push_back(nChild);
+    BuildScaleHandles(pairs, **std::prev(item.children.end()), times);
+  }
+
+  return fNode;
 }
 
 static void PopulateScaleData(MTFTrackPair &item, const Times &times,
-                              const Secs &secs) {
+                              const Secs &secs, float frameRate) {
   if (!item.scaleNode)
     return;
 
   const size_t numKeys = times.size();
-  Control *cnt = item.scaleNode->GetTMController()->GetScaleController();
+  Control *cnt = item.scaleNode->GetTMController();
 
   AnimateOn();
 
   if (item.track) {
     for (int t = 0; t < numKeys; t++) {
       Vector4A16 cVal;
-      item.track->Interpolate(cVal, secs[t]);
+      item.track->Interpolate(cVal, secs[t], frameRate);
       item.frames[t] *= cVal;
 
       if (item.parent)
         item.frames[t] *= item.parent->frames[t];
 
-      Point3 kVal(item.frames[t].X, item.frames[t].Y, item.frames[t].Z);
+      Matrix3 cMat(1);
+      cMat.SetScale(
+          Point3(item.frames[t].X, item.frames[t].Y, item.frames[t].Z));
 
-      cnt->SetValue(times[t], &kVal);
+      SetXFormPacket packet(cMat);
+
+      cnt->SetValue(times[t], &packet);
     }
   }
 
   AnimateOff();
 
-  for (auto &c : item.children) {
-    PopulateScaleData(*c, times, secs);
-  }
+  for (auto &c : item.children)
+    PopulateScaleData(*c, times, secs, frameRate);
 }
 
 static void
@@ -427,17 +426,6 @@ FixupHierarchialTranslations(INode *nde, const Times &times,
                   Point3(scaleValues[t].X, scaleValues[t].Y, scaleValues[t].Z);
     }
 
-    /*for (int t = 0; t < numKeys; t++) {
-      Matrix3 rVal = childNode->GetNodeTM(times[t]);
-      Matrix3 pVal = parentTransforms->at(t);
-      pVal.Invert();
-      rVal *= pVal;
-      rVal.SetTrans(rVal.GetTrans() * Point3(scaleValues[t].X, scaleValues[t].Y,
-    scaleValues[t].Z)); pVal.Invert(); rVal *= pVal; pVal =
-    nde->GetNodeTM(times[t]); pVal.Invert(); rVal *= pVal; values[t] =
-    rVal.GetTrans();
-    }*/
-
     Control *cnt = childNode->GetTMController()->GetPositionController();
 
     AnimateOn();
@@ -447,8 +435,6 @@ FixupHierarchialTranslations(INode *nde, const Times &times,
     }
 
     AnimateOff();
-    //FixupHierarchialTranslations(childNode, times, scaleValues,
-                                // parentTransforms);
   }
 }
 
@@ -469,28 +455,10 @@ static void ScaleTranslations(MTFTrackPair &item, const Times &times) {
   }
 }
 
-static void ApplyScaleTracks(MTFTrackPairCnt &tracks, const Times &times,
-                             const Secs &secs) {
-  std::vector<MTFTrackPair *> rootsOnly;
-
-  for (auto &s : tracks)
-    if (IsRoot(tracks, s.nde))
-      rootsOnly.push_back(&s);
-
-  for (auto &s : rootsOnly)
-    BuildScaleHandles(tracks, *s, times);
-
-  for (auto &s : rootsOnly)
-    PopulateScaleData(*s, times, secs);
-
-  for (auto &s : rootsOnly)
-    ScaleTranslations(*s, times);
-}
-
-void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
+TimeValue MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
   const int numTracks = mot.NumTracks();
-  SetFrameRate(60);
-  const float aDuration = mot.NumFrames() / 60.f;
+  const float frameRate = 30.f * (IDC_CB_FRAMERATE_index + 1);
+  const float aDuration = mot.NumFrames() / frameRate;
 
   TimeValue numTicks = SecToTicks(aDuration);
   TimeValue ticksPerFrame = GetTicksPerFrame();
@@ -501,16 +469,17 @@ void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
   else
     numTicks -= overlappingTicks;
 
-  Interval aniRange(0, numTicks - ticksPerFrame);
-  GetCOREInterface()->SetAnimRange({-TIME_TICKSPERSEC, numTicks});
+  Interval aniRange(startTime, startTime + numTicks - ticksPerFrame);
   std::vector<float> frameTimes;
   Times frameTimesTicks;
 
-  for (TimeValue v = 0; v <= aniRange.End(); v += GetTicksPerFrame()) {
-    frameTimes.push_back(TicksToSec(v));
+  for (TimeValue v = aniRange.Start(); v <= aniRange.End();
+       v += GetTicksPerFrame()) {
+    frameTimes.push_back(TicksToSec(v - startTime));
     frameTimesTicks.push_back(v);
   }
 
+  const size_t numFrames = frameTimes.size();
   std::vector<MTFTrackPair> scaleTracks;
 
   for (int t = 0; t < numTracks; t++) {
@@ -532,7 +501,7 @@ void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
     BuildScaleHandles(scaleTracks, *s, frameTimesTicks);
 
   iBoneScanner.RescanBones();
-  iBoneScanner.ResetScene();
+  iBoneScanner.RestoreBasePose(startTime);
 
   for (int t = 0; t < numTracks; t++) {
     const LMTTrack *tck = mot.Track(t);
@@ -555,9 +524,9 @@ void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
 
       AnimateOn();
 
-      for (auto ft : frameTimes) {
+      for (int i = 0; i < numFrames; i++) {
         Vector4A16 cVal;
-        tck->Interpolate(cVal, ft);
+        tck->Interpolate(cVal, frameTimes[i], frameRate);
         cVal *= IDC_EDIT_SCALE_value;
         Point3 kVal = reinterpret_cast<Point3 &>(cVal);
 
@@ -565,7 +534,7 @@ void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
             tckType == LMTTrack::TrackType_AbsolutePosition)
           kVal = corMat.PointTransform(kVal);
 
-        posCnt->SetValue(SecToTicks(ft), &kVal);
+        posCnt->SetValue(frameTimesTicks[i], &kVal);
       }
 
       AnimateOff();
@@ -573,14 +542,12 @@ void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
     }
     case LMTTrack::TrackType_AbsoluteRotation:
     case LMTTrack::TrackType_LocalRotation: {
-      Control *rotCnt = (Control *)CreateInstance(
-          CTRL_ROTATION_CLASS_ID, Class_ID(HYBRIDINTERP_ROTATION_CLASS_ID, 0));
-
+      Control *rotCnt = cnt->GetRotationController();
       AnimateOn();
 
-      for (auto ft : frameTimes) {
+      for (int i = 0; i < numFrames; i++) {
         Vector4A16 cVal;
-        tck->Interpolate(cVal, ft);
+        tck->Interpolate(cVal, frameTimes[i], frameRate);
         Quat kVal = reinterpret_cast<Quat &>(cVal).Conjugate();
 
         if (fNode->GetParentNode()->IsRootNode() ||
@@ -590,12 +557,10 @@ void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
           kVal = cMat * corMat;
         }
 
-        rotCnt->SetValue(SecToTicks(ft), &kVal);
+        rotCnt->SetValue(frameTimesTicks[i], &kVal);
       }
 
       AnimateOff();
-      cnt->GetRotationController()->Copy(rotCnt); // Gimbal fix
-
       break;
     }
     default:
@@ -604,12 +569,17 @@ void MTFImport::LoadMotion(const LMTAnimation &mot, TimeValue startTime) {
   }
 
   for (auto &s : rootsOnly)
-    PopulateScaleData(*s, frameTimesTicks, frameTimes);
+    PopulateScaleData(*s, frameTimesTicks, frameTimes, frameRate);
 
   for (auto &s : rootsOnly)
     ScaleTranslations(*s, frameTimesTicks);
 
+  if (aniRange.Start() == aniRange.End()) {
+    aniRange.SetEnd(aniRange.End() + ticksPerFrame);
+  }
+
   GetCOREInterface()->SetAnimRange(aniRange);
+  return aniRange.End() + ticksPerFrame;
 }
 
 int MTFImport::DoImport(const TCHAR *fileName, ImpInterface * /*importerInt*/,
@@ -634,19 +604,48 @@ int MTFImport::DoImport(const TCHAR *fileName, ImpInterface * /*importerInt*/,
     curMotionID++;
   }
 
+  instanceDialogType = DLGTYPE_LMT;
+
   if (!suppressPrompts)
     if (!SpawnDialog())
       return TRUE;
 
-  const LMTAnimation *mot = mainAsset.Animation(IDC_CB_MOTION_index);
-
-  if (!mot)
-    return FALSE;
+  GetCOREInterface()->ClearNodeSelection();
 
   iBoneScanner.RescanBones();
-  LoadMotion(*mot);
+  iBoneScanner.ResetScene();
+
+  if (!flags[IDC_CH_RESAMPLE_checked])
+    SetFrameRate(30.f * (IDC_CB_FRAMERATE_index + 1));
+
+  if (flags[IDC_RD_ANISEL_checked]) {
+    const LMTAnimation *mot = mainAsset.Animation(IDC_CB_MOTION_index);
+
+    if (!mot)
+      return FALSE;
+
+    LoadMotion(*mot, 0);
+  } else {
+    TimeValue lastTime = 0;
+    int i = 0;
+
+    printline("Sequencer not found, dumping animation ranges:");
+
+    for (auto &a : mainAsset) {
+
+      if (a) {
+        TimeValue nextTime = LoadMotion(*a, lastTime);
+        printer << motionNames[i] << ": " << lastTime << ", " << nextTime >> 1;
+        lastTime = nextTime;
+        iBoneScanner.LockPose(nextTime - GetTicksPerFrame());
+      }
+
+      i++;
+    }
+  }
+
   iBoneScanner.RescanBones();
-  iBoneScanner.RestoreBasePose();
+  iBoneScanner.RestoreBasePose(-GetTicksPerFrame());
 
   setlocale(LC_NUMERIC, oldLocale);
 
